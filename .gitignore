@@ -1,0 +1,27 @@
+# PowerShell
+*.ps1.save
+*.ps1~
+*.psm1.save
+
+# Logs
+*.log
+logs/
+# Migration run folders (optional to keep). Comment this out if you want logs committed.
+FSLogix-Migration-Logs/
+
+# JSON reports (adjust if you want to track)
+Migration-Summary-*.json
+
+# VS Code
+.vscode/
+.history/
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Temporary
+*.tmp
+*.bak
+~$*
