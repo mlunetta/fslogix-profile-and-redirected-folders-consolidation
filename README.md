@@ -190,16 +190,6 @@ Exit codes:
 | Azure share disconnect warnings | Usually benign if share already disconnected; script attempts cleanup in `finally` |
 
 ---
-## 🔍 Future Enhancements (Ideas)
-- Parallel user processing (Runspaces / PowerShell Jobs)
-- Progress dashboard (PSCustomObject -> Out-GridView or HTML report)
-- Integrity hash verification (pre/post) for critical folders
-- Optional folder inclusion/exclusion list override
-- CSV import of users
-- Support for SAS tokens (avoid using account keys)
-- Option to use Azure AD Kerberos for Azure Files instead of key (no `net use` with key)
-
----
 ## 🤝 Contributing
 1. Fork the repository
 2. Create a feature branch (`feat/parallel-migration`)
