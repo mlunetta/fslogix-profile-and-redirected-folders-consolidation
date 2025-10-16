@@ -141,7 +141,7 @@ Hybrid (Destination Azure only):
 ./FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix$" -SourceAzure:$false -DestinationShare "\\myaccdst.file.core.windows.net\profiles" -RedirectedShare "\\filesvr\Redirected$" -LogPath "C:\Temp\Logs" -UserList "alice,bob" -DestinationAzure -DestinationStorageAccountName "myaccdst" -DestinationStorageAccountKey (Read-Host 'Dest Key' -AsSecureString)
 ```
 
-> Authentication: The script connects to Azure Files using `net use` with `/user:Azure\\<StorageAccountName>` and the storage account key.
+> Authentication: The script connects to Azure Files using `net use` with `/user:localhost\<StorageAccountName>` and the storage account key.
 
 ---
 ## 🧪 Test Mode Behavior
