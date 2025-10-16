@@ -72,6 +72,12 @@ Run in an elevated PowerShell session on an administrative host with access to a
 | `-UserList` | String[] | No | Comma-separated or array of explicit usernames |
 | `-UserPrefix` | String[] | No | One or more prefixes (supports comma-separated) |
 | `-ExistingProfileAction` | Overwrite/Maintain | No | Overwrite (default) or Maintain (skip copy if destination exists) |
+| `-SourceAzure` | Switch | No | Treat SourceShare as Azure Files (or auto-detected by UNC pattern) |
+| `-DestinationAzure` | Switch | No | Treat DestinationShare as Azure Files (or auto-detected by UNC pattern) |
+| `-SourceStorageAccountName` | String | Conditional | Storage account name for source Azure Files (prompted if omitted) |
+| `-SourceStorageAccountKey` | SecureString | Conditional | Account key (secure) for source Azure Files (prompted if omitted) |
+| `-DestinationStorageAccountName` | String | Conditional | Storage account name for destination Azure Files (prompted if omitted) |
+| `-DestinationStorageAccountKey` | SecureString | Conditional | Account key (secure) for destination Azure Files (prompted if omitted) |
 
 ### Examples
 Process ALL users:
@@ -99,6 +105,44 @@ Interactive user selection (omit targeting switches):
 ./FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix$" -DestinationShare "\\new-server\fslogix$" -RedirectedShare "\\filesvr\Redirected$" -LogPath "C:\Temp\FSLogix-Migration-Logs"
 ```
 
+Azure Files (explicit flags + passed credentials):
+```powershell
+./FSLogix-Profile-Migration.ps1 -SourceShare "\\myacctsrc.file.core.windows.net\profiles" -DestinationShare "\\myaccdst.file.core.windows.net\profiles" -RedirectedShare "\\filesvr\Redirected$" -LogPath "C:\Temp\Logs" -AllUsers -SourceAzure -DestinationAzure -SourceStorageAccountName "myacctsrc" -DestinationStorageAccountName "myaccdst" -SourceStorageAccountKey (Read-Host 'Source Key' -AsSecureString) -DestinationStorageAccountKey (Read-Host 'Dest Key' -AsSecureString)
+```
+
+Azure Files (auto-detect pattern, interactive key prompt):
+```powershell
+./FSLogix-Profile-Migration.ps1 -SourceShare "\\myacctsrc.file.core.windows.net\profiles" -DestinationShare "\\myaccdst.file.core.windows.net\profiles" -RedirectedShare "\\filesvr\Redirected$" -LogPath "C:\Temp\Logs" -AllUsers
+```
+The script will detect the `*.file.core.windows.net` UNC and prompt for missing storage account name/key (if not derivable from UNC) and mount using `net use` with `Azure\<account>`.
+
+### Azure Files Tri-State Behavior
+`-SourceAzure` and `-DestinationAzure` behave as tri-state controls:
+| Case | Action | Prompt? | Result |
+|------|--------|---------|--------|
+| Explicit Azure | Include switch (e.g. `-SourceAzure`) | No | Treated as Azure Files |
+| Explicit Non-Azure | Include switch with false (e.g. `-SourceAzure:$false`) | No | Treated as standard SMB |
+| Unspecified | Omit switch | Yes* | Prompt (pattern-based first) |
+
+*If the UNC matches the Azure Files pattern (`\\account.file.core.windows.net\share`), the prompt clarifies detection; otherwise a generic Y/N question is used.
+
+Force non-Azure (suppresses prompt despite pattern):
+```powershell
+./FSLogix-Profile-Migration.ps1 -SourceShare "\\myacctsrc.file.core.windows.net\profiles" -DestinationShare "\\new-server\fslogix$" -RedirectedShare "\\filesvr\Redirected$" -LogPath "C:\Temp\Logs" -AllUsers -SourceAzure:$false -DestinationAzure:$false
+```
+
+Hybrid (Source Azure, Destination standard SMB):
+```powershell
+./FSLogix-Profile-Migration.ps1 -SourceShare "\\myacctsrc.file.core.windows.net\profiles" -DestinationShare "\\new-server\fslogix$" -DestinationAzure:$false -RedirectedShare "\\filesvr\Redirected$" -LogPath "C:\Temp\Logs" -AllUsers -SourceAzure -SourceStorageAccountName "myacctsrc" -SourceStorageAccountKey (Read-Host 'Source Key' -AsSecureString)
+```
+
+Hybrid (Destination Azure only):
+```powershell
+./FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix$" -SourceAzure:$false -DestinationShare "\\myaccdst.file.core.windows.net\profiles" -RedirectedShare "\\filesvr\Redirected$" -LogPath "C:\Temp\Logs" -UserList "alice,bob" -DestinationAzure -DestinationStorageAccountName "myaccdst" -DestinationStorageAccountKey (Read-Host 'Dest Key' -AsSecureString)
+```
+
+> Authentication: The script connects to Azure Files using `net use` with `/user:Azure\\<StorageAccountName>` and the storage account key.
+
 ---
 ## 🧪 Test Mode Behavior
 When `-TestMode` is present:
@@ -107,6 +151,7 @@ When `-TestMode` is present:
 - VHD/VHDX not actually mounted (fake drive letter returned)
 - Registry not modified
 - Flow & selection logic still validated
+- Azure Files shares are NOT mounted; connection steps are logged only
 
 ---
 ## 📄 Logging & Reports
@@ -141,6 +186,8 @@ Exit codes:
 | Missing redirected folders | Ensure correct share root layout: `\\redirected\share\<username>\Documents` etc. |
 | Permission denied on copy | Validate current context has Full Control or adequate read/write/ownership rights |
 | Timeouts or slowness | Reduce `/MT` threads or run off-hours; network latency or contention may be a factor |
+| Azure Files connect fails | Verify storage account key & that port 445 outbound is allowed; ensure UNC format `\\account.file.core.windows.net\share` |
+| Azure share disconnect warnings | Usually benign if share already disconnected; script attempts cleanup in `finally` |
 
 ---
 ## 🔍 Future Enhancements (Ideas)
@@ -149,6 +196,8 @@ Exit codes:
 - Integrity hash verification (pre/post) for critical folders
 - Optional folder inclusion/exclusion list override
 - CSV import of users
+- Support for SAS tokens (avoid using account keys)
+- Option to use Azure AD Kerberos for Azure Files instead of key (no `net use` with key)
 
 ---
 ## 🤝 Contributing

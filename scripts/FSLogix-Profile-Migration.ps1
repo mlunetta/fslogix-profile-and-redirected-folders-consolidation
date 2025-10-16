@@ -36,13 +36,36 @@
     
 .EXAMPLE
     Run for all users discovered in source share:
-    .\FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix$" -DestinationShare "\\new-server\fslogix$" -RedirectedShare "\\server1\Redirected$" -LogPath "C:\Temp\FSLogix-Migration-Logs" -AllUsers
+    .\FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix" -DestinationShare "\\new-server\fslogix" -RedirectedShare "\\server1\Redirected" -LogPath "C:\Temp\FSLogix-Migration-Logs" -AllUsers
+
     Run for specific users by prefix:
-    .\FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix$" -DestinationShare "\\new-server\fslogix$" -RedirectedShare "\\server1\Redirected$" -LogPath "C:\Temp\FSLogix-Migration-Logs" -UserPrefix "eng,test"
+    .\FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix" -DestinationShare "\\new-server\fslogix" -RedirectedShare "\\server1\Redirected" -LogPath "C:\Temp\FSLogix-Migration-Logs" -UserPrefix "eng,test"
+    
     Run for specific users by explicit list:
-    .\FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix$" -DestinationShare "\\new-server\fslogix$" -RedirectedShare "\\server1\Redirected$" -LogPath "C:\Temp\FSLogix-Migration-Logs" -UserList "user1,user2"
+    .\FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix" -DestinationShare "\\new-server\fslogix" -RedirectedShare "\\server1\Redirected" -LogPath "C:\Temp\FSLogix-Migration-Logs" -UserList "user1,user2"
+    
     Run with existing profile action set to Maintain (skip existing profiles):
-    .\FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix$" -DestinationShare "\\new-server\fslogix$" -RedirectedShare "\\server1\Redirected$" -LogPath "C:\Temp\FSLogix-Migration-Logs" -UserList "user1,user2" -ExistingProfileAction Maintain
+    .\FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix" -DestinationShare "\\new-server\fslogix" -RedirectedShare "\\server1\Redirected" -LogPath "C:\Temp\FSLogix-Migration-Logs" -UserList "user1,user2" -ExistingProfileAction Maintain
+    
+    Run with only destination as Azure Files share:
+    $dstKey = ConvertTo-SecureString 'DEST_ACCOUNT_KEY_VALUE' -AsPlainText -Force
+    .\FSLogix-Profile-Migration.ps1 `
+    -SourceShare "\\src-fileserver\\profiles" -SourceAzure:$false `
+    -DestinationShare "\\destacct.file.core.windows.net\\profiles" -DestinationAzure -DestinationStorageAccountName "destacct" -DestinationStorageAccountKey $dstKey `
+    -RedirectedShare "\\src-redirected-fileserver\\Redirected" `
+    -LogPath "C:\\Temp\\FSLogix-Migration-Logs" `
+    -UserList "user1,user2"
+
+    Run with both Azure Files shares and non-interactive (no prompts):
+    $srcKey = ConvertTo-SecureString 'SOURCE_ACCOUNT_KEY_VALUE' -AsPlainText -Force
+    $dstKey = ConvertTo-SecureString 'DEST_ACCOUNT_KEY_VALUE' -AsPlainText -Force
+    .\FSLogix-Profile-Migration.ps1 `
+    -SourceShare "\\sourceacct.file.core.windows.net\\profiles" -SourceAzure -SourceStorageAccountName "sourceacct" -SourceStorageAccountKey $srcKey`
+    -DestinationShare "\\destacct.file.core.windows.net\\profiles" -DestinationAzure -DestinationStorageAccountName "destacct" -DestinationStorageAccountKey $dstKey`
+    -RedirectedShare "\\sourceacct.file.core.windows.net\\Redirected" `
+    -LogPath "C:\\Temp\\FSLogix-Migration-Logs" `
+    -AllUsers
+
 #>
 
 param(
@@ -74,6 +97,20 @@ param(
     [Parameter(Mandatory=$false, HelpMessage='Action when destination FSLogix profile already exists: Overwrite or Maintain (default: Overwrite)')]
     [ValidateSet('Overwrite','Maintain')]
     [string]$ExistingProfileAction = 'Overwrite'
+    ,
+    # Azure Files support (optional)
+    [Parameter(Mandatory=$false, HelpMessage='Treat source share as Azure Files UNC (\\\\<account>.file.core.windows.net\\\\<share>)')]
+    [switch]$SourceAzure,
+    [Parameter(Mandatory=$false, HelpMessage='Treat destination share as Azure Files UNC (\\\\<account>.file.core.windows.net\\\\<share>)')]
+    [switch]$DestinationAzure,
+    [Parameter(Mandatory=$false, HelpMessage='Storage account name for source Azure Files share')]
+    [string]$SourceStorageAccountName,
+    [Parameter(Mandatory=$false, HelpMessage='Storage account key (secure) for source Azure Files share')]
+    [SecureString]$SourceStorageAccountKey,
+    [Parameter(Mandatory=$false, HelpMessage='Storage account name for destination Azure Files share')]
+    [string]$DestinationStorageAccountName,
+    [Parameter(Mandatory=$false, HelpMessage='Storage account key (secure) for destination Azure Files share')]
+    [SecureString]$DestinationStorageAccountKey
 )
 
 # Normalize spelling (Mantain -> Maintain)
@@ -83,6 +120,8 @@ if ($ExistingProfileAction -eq 'Mantain') { $ExistingProfileAction = 'Maintain' 
 $ErrorActionPreference = "Stop"
 $RedirectedFolders = @("Documents", "Videos", "Pictures", "Music", "Desktop", "Downloads", "Favorites")
 $StartTime = Get-Date
+$Global:AzureMountedShares = @() # Track azure shares mounted
+$script:FinalExitCode = 0
 
 # Create base log path if missing
 if (!(Test-Path $LogPath)) { New-Item -ItemType Directory -Path $LogPath -Force | Out-Null }
@@ -163,6 +202,58 @@ function Test-Prerequisites {
     
     Write-Log "Prerequisites check passed" -Level "SUCCESS"
 }
+
+#region AzureFilesHelpers
+function Invoke-AzureDecision {
+    param(
+        [string]$SharePath,
+        [string]$Role,  # 'Source' or 'Destination'
+        [bool]$ExplicitAzureValue,   # Value of switch (true if present and set, false if present and explicitly negative)
+        [bool]$WasParameterSpecified  # Did caller specify parameter at all
+    )
+    $patternMatch = ($SharePath -match '^\\\\[a-z0-9\-]+\.file\.core\.windows\.net\\')
+    if ($WasParameterSpecified) { return $ExplicitAzureValue }
+    if ($patternMatch) {
+        $resp = Read-Host "Detected Azure Files pattern for $Role share ($SharePath). Treat as Azure? (Y/N)"
+        return ($resp.ToUpper() -eq 'Y')
+    }
+    $resp2 = Read-Host "Treat $Role share as Azure Files? (Y/N)"
+    return ($resp2.ToUpper() -eq 'Y')
+}
+function Convert-SecureToPlain {
+    param([SecureString]$Secure)
+    if (-not $Secure) { return $null }
+    return (New-Object System.Net.NetworkCredential('', $Secure)).Password
+}
+function Get-AzureAccountNameFromUNC {
+    param([string]$UNC)
+    if ($UNC -match '^\\\\([a-z0-9\-]+)\.file\.core\.windows\.net\\') { return $Matches[1] }
+    return $null
+}
+function Connect-AzureFileShare {
+    param(
+        [Parameter(Mandatory)] [string]$UNCPath,
+        [Parameter(Mandatory)] [string]$StorageAccountName,
+        [Parameter(Mandatory)] [SecureString]$StorageAccountKey,
+        [switch]$TestOnly
+    )
+    Write-Log "Establishing Azure Files connection: $UNCPath" -Level INFO
+    if ($TestOnly) { Write-Log "TEST MODE: Would connect Azure Files share $UNCPath" -Level WARNING; return $true }
+    $plain = Convert-SecureToPlain $StorageAccountKey
+    if (-not $plain) { throw "Storage account key not provided for $UNCPath" }
+    $masked = if ($plain.Length -ge 8) { $plain.Substring(0,4)+'...'+$plain.Substring($plain.Length-4) } else { '***' }
+    Write-Log "Using account '$StorageAccountName' (Key: $masked)" -Level INFO
+    $cmd = "net use $UNCPath /user:localhost\$StorageAccountName $plain /persistent:no"
+    cmd.exe /c $cmd 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Log "Failed to connect Azure Files share ($LASTEXITCODE): $out" -Level ERROR
+        return $false
+    }
+    $Global:AzureMountedShares += $UNCPath
+    Write-Log "Azure Files share connected: $UNCPath" -Level SUCCESS
+    return $true
+}
+#endregion AzureFilesHelpers
 
 function Get-FSLogixUsers {
     Write-Log "Discovering FSLogix users from source share (username-based folders)..."
@@ -694,8 +785,42 @@ try {
     Write-Log "Redirected Folders Share: $RedirectedShare" -Level "INFO"
     Write-Log "Log Path: $LogPath" -Level "INFO"
     Write-Log "Test Mode: $TestMode" -Level "INFO"
+    # Azure Files hybrid detection:
+    # 1. If switch provided -> treat as Azure (override)
+    # 2. Else if UNC matches pattern -> ask for confirmation
+    # 3. Else prompt user (Y/N) to treat as Azure (default N)
+
+    # Determine if user specified switches (even if false) using PSBoundParameters
+    $sourceAzureSpecified = $PSBoundParameters.ContainsKey('SourceAzure')
+    $destAzureSpecified   = $PSBoundParameters.ContainsKey('DestinationAzure')
+    # Derive explicit boolean values: if specified, use the switch value ($true or $false); else placeholder false (will trigger prompt logic later)
+    $explicitSourceAzureValue = if ($sourceAzureSpecified) { [bool]$SourceAzure } else { $false }
+    $explicitDestAzureValue   = if ($destAzureSpecified)   { [bool]$DestinationAzure } else { $false }
+    $isSourceAzure = Invoke-AzureDecision -SharePath $SourceShare -Role 'Source' -ExplicitAzureValue $explicitSourceAzureValue -WasParameterSpecified $sourceAzureSpecified
+    $isDestinationAzure = Invoke-AzureDecision -SharePath $DestinationShare -Role 'Destination' -ExplicitAzureValue $explicitDestAzureValue -WasParameterSpecified $destAzureSpecified
+    Write-Log "Azure decision (Source): Specified=$sourceAzureSpecified Value=$isSourceAzure" -Level INFO
+    Write-Log "Azure decision (Destination): Specified=$destAzureSpecified Value=$isDestinationAzure" -Level INFO
+
+    if ($isSourceAzure) {
+        Write-Log 'Source share treated as Azure Files.' -Level INFO
+        if (-not $SourceStorageAccountName) { $SourceStorageAccountName = Get-AzureAccountNameFromUNC -UNC $SourceShare }
+        if (-not $SourceStorageAccountName) { $SourceStorageAccountName = Read-Host 'Enter Source storage account name' }
+        if (-not $SourceStorageAccountKey) { $SourceStorageAccountKey = Read-Host 'Enter Source storage account key' -AsSecureString }
+        [void](Connect-AzureFileShare -UNCPath $SourceShare -StorageAccountName $SourceStorageAccountName -StorageAccountKey $SourceStorageAccountKey -TestOnly:$TestMode)
+    } else {
+        Write-Log 'Source share treated as standard SMB (not Azure Files).' -Level INFO
+    }
+    if ($isDestinationAzure) {
+        Write-Log 'Destination share treated as Azure Files.' -Level INFO
+        if (-not $DestinationStorageAccountName) { $DestinationStorageAccountName = Get-AzureAccountNameFromUNC -UNC $DestinationShare }
+        if (-not $DestinationStorageAccountName) { $DestinationStorageAccountName = Read-Host 'Enter Destination storage account name' }
+        if (-not $DestinationStorageAccountKey) { $DestinationStorageAccountKey = Read-Host 'Enter Destination storage account key' -AsSecureString }
+        [void](Connect-AzureFileShare -UNCPath $DestinationShare -StorageAccountName $DestinationStorageAccountName -StorageAccountKey $DestinationStorageAccountKey -TestOnly:$TestMode)
+    } else {
+        Write-Log 'Destination share treated as standard SMB (not Azure Files).' -Level INFO
+    }
     
-    # Test prerequisites
+    # Test prerequisites after potential Azure Files connections
     Test-Prerequisites
     
     # Get list of FSLogix users
@@ -703,7 +828,8 @@ try {
     
     if ($users.Count -eq 0) {
         Write-Log "No FSLogix users found in source share" -Level "WARNING"
-        exit 0
+        $script:FinalExitCode = 0
+        throw [System.Exception]::new('TerminateEarlyNoUsers')
     }
 
     # Apply selection logic (wrap in @( ) to force array so .Count works when a single object is returned)
@@ -711,7 +837,8 @@ try {
     if ($null -eq $targetUsers) { $targetUsers = @() } elseif ($targetUsers -isnot [System.Array]) { $targetUsers = @($targetUsers) }
     if (-not $targetUsers -or $targetUsers.Count -eq 0) {
         Write-Log 'No target users resolved after selection. Exiting.' -Level ERROR
-        exit 0
+        $script:FinalExitCode = 0
+        throw [System.Exception]::new('TerminateEarlyNoTargets')
     }
 
     Write-Log "Users selected for processing ($($targetUsers.Count)): $($targetUsers.Username -join ', ')" -Level INFO
@@ -776,10 +903,22 @@ try {
 
     Write-Log "=== FSLogix Profile Migration Script Completed ===" -Level "SUCCESS"
 
-    if ($failedMigrations -gt 0) { exit 1 } else { exit 0 }
+    $script:FinalExitCode = if ($failedMigrations -gt 0) { 1 } else { 0 }
 }
 catch {
     Write-Log "Critical error in migration script: $($_.Exception.Message)" -Level "ERROR"
     Write-Log "Stack trace: $($_.Exception.StackTrace)" -Level "ERROR"
-    exit 2
+    if ($script:FinalExitCode -eq 0 -and $_.Exception.Message -notin 'TerminateEarlyNoUsers','TerminateEarlyNoTargets') { $script:FinalExitCode = 2 }
+}
+finally {
+    foreach ($share in $Global:AzureMountedShares) {
+        try {
+            Write-Log "Disconnecting Azure Files share: $share" -Level INFO
+            $out = & cmd.exe /c "net use $share /delete /y" 2>&1
+            if ($LASTEXITCODE -eq 0) { Write-Log "Disconnected $share" -Level SUCCESS } else { Write-Log "Failed to disconnect $share ($LASTEXITCODE): $out" -Level WARNING }
+        } catch {
+            Write-Log "Exception while disconnecting $share : $($_.Exception.Message)" -Level WARNING
+        }
+    }
+    exit $script:FinalExitCode
 }
