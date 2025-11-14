@@ -13,6 +13,10 @@
     4. Repairing registry references (Explorer paths)
     5. Safely unmounting the VHDX files
 
+     Added functionality:
+     - Import explicit user list from an Excel (.xlsx) file containing a header column named 'Username'
+    - Automatically installs ImportExcel module if missing (falls back to COM if install fails)
+
     This consolidates separated redirected folders back into FSLogix profiles.
     All Robocopy operations preserve security (ACLs, owner, SACL), timestamps and attributes using /COPYALL and /DCOPY:DAT (directory copy flags only support D,A,T)
     with /SECFIX and /TIMFIX to repair security or timestamp discrepancies on retries.
@@ -44,6 +48,9 @@
     Run for specific users by explicit list:
     .\FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix" -DestinationShare "\\new-server\fslogix" -RedirectedShare "\\server1\Redirected" -LogPath "C:\Temp\FSLogix-Migration-Logs" -UserList "user1,user2"
     
+    Run for using excel as input:
+    .\FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix" -DestinationShare "\\new-server\fslogix" -RedirectedShare "\\server1\Redirected" -LogPath "C:\Temp\FSLogix-Migration-Logs" -UserListExcelPath "C:\Temp\UsersToMigrate.xlsx"
+
     Run with existing profile action set to Maintain (skip existing profiles):
     .\FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix" -DestinationShare "\\new-server\fslogix" -RedirectedShare "\\server1\Redirected" -LogPath "C:\Temp\FSLogix-Migration-Logs" -UserList "user1,user2" -ExistingProfileAction Maintain
     
@@ -93,6 +100,9 @@ param(
 
     [Parameter(Mandatory=$false, HelpMessage='One or more username prefixes (comma-separated accepted)')]
     [string[]]$UserPrefix,
+
+    [Parameter(Mandatory=$false, HelpMessage='Excel file (.xlsx) containing a column named "Username" for explicit user list import')]
+    [string]$UserListExcelPath,
 
     [Parameter(Mandatory=$false, HelpMessage='Action when destination FSLogix profile already exists: Overwrite or Maintain (default: Overwrite)')]
     [ValidateSet('Overwrite','Maintain')]
@@ -288,7 +298,50 @@ function Get-FSLogixUsers {
     return $users
 }
 
-# New helper to resolve which users to process based on parameters or interactive selection
+
+# Load usernames from an Excel file (.xlsx) that contains a header named 'Username'.
+function Load-UserListFromExcel {
+    param(
+        [Parameter(Mandatory)] [string]$ExcelPath
+    )
+    $imported = @()
+    if (-not (Test-Path $ExcelPath)) {
+        Write-Log "Excel file not found: $ExcelPath" -Level ERROR
+        return $imported
+    }
+    Write-Log "Attempting to import usernames from Excel: $ExcelPath" -Level INFO
+    try {
+        # Try ensuring module (install if missing)
+        if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+            Write-Log 'ImportExcel module not found. Attempting installation...' -Level WARNING
+            try {
+                $repo = Get-PSRepository -Name 'PSGallery' -ErrorAction SilentlyContinue
+                if ($repo -and $repo.InstallationPolicy -ne 'Trusted') {
+                    Write-Log 'Setting PSGallery installation policy to Trusted' -Level INFO
+                    Set-PSRepository -Name 'PSGallery' -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+                }
+                Install-Module -Name ImportExcel -Scope AllUsers -Force -ErrorAction Stop
+                Import-Module  -Name ImportExcel -Force -ErrorAction Stop
+                Write-Log 'ImportExcel module installed successfully.' -Level SUCCESS
+            } catch {
+                Write-Log "ImportExcel module installation failed: $($_.Exception.Message). Will use COM fallback." -Level ERROR
+            }
+        }
+        if (Get-Module -ListAvailable -Name ImportExcel) {
+            $rows = Import-Excel -Path $ExcelPath -ErrorAction Stop
+            if ($rows) {
+                $imported = $rows | ForEach-Object { $_.Username } | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() }
+                Write-Log "Imported $($imported.Count) usernames using ImportExcel module." -Level SUCCESS
+            } else {
+                Write-Log "No rows returned by Import-Excel." -Level WARNING
+            }
+        }
+    } catch {
+        Write-Log "Excel import failed: $($_.Exception.Message)" -Level ERROR
+    }
+    return ($imported | Sort-Object -Unique)
+}
+
 function Resolve-TargetUsers {
     param(
         [Parameter(Mandatory)] [array]$AllDiscoveredUsers,
@@ -340,8 +393,9 @@ function Resolve-TargetUsers {
     Write-Host '[A] All users'
     Write-Host '[L] Explicit comma-separated list'
     Write-Host '[P] Prefix-based (users whose names start with given string(s))'
+    Write-Host '[E] Excel file (.xlsx) with column "Username"'
     Write-Host ''
-    $choice = Read-Host 'Enter choice (A/L/P)'
+    $choice = Read-Host 'Enter choice (A/L/P/E)'
 
     switch ($choice.ToUpperInvariant()) {
         'A' { Write-Log 'Interactive selection: All users' -Level INFO; return $AllDiscoveredUsers }
@@ -362,6 +416,20 @@ function Resolve-TargetUsers {
             $selected = $selected | Sort-Object Username -Unique
             if (-not $selected) { Write-Log 'No users matched your prefix(es).' -Level WARNING }
             Write-Log "Interactive selection: Prefix(es) $($prefixes -join ', ') matched $($selected.Count) user(s)" -Level INFO
+            return $selected
+        }
+        'E' {
+            $excelPath = Read-Host 'Enter full path to Excel (.xlsx) file'
+            if (-not $excelPath) { Write-Log 'No Excel path entered.' -Level ERROR; return @() }
+            $excelUsers = Load-UserListFromExcel -ExcelPath $excelPath
+            if (-not $excelUsers -or $excelUsers.Count -eq 0) {
+                Write-Log 'Excel import returned zero usernames.' -Level ERROR
+                return @()
+            }
+            Write-Log "Excel imported usernames ($($excelUsers.Count)): $($excelUsers -join ', ')" -Level INFO
+            $selected = $AllDiscoveredUsers | Where-Object { $_.Username -in $excelUsers }
+            $missing = $excelUsers | Where-Object { $_ -notin $allNames }
+            if ($missing) { Write-Log "User(s) in Excel not found in source share: $($missing -join ', ')" -Level WARNING }
             return $selected
         }
         Default { Write-Log "Invalid selection '$choice'" -Level ERROR; return @() }
@@ -836,6 +904,17 @@ try {
         Write-Log "No FSLogix users found in source share" -Level "WARNING"
         $script:FinalExitCode = 0
         throw [System.Exception]::new('TerminateEarlyNoUsers')
+    }
+
+    # If Excel path provided, import usernames and override explicit list logic
+    if ($UserListExcelPath) {
+        $excelUsers = Load-UserListFromExcel -ExcelPath $UserListExcelPath
+        if ($excelUsers -and $excelUsers.Count -gt 0) {
+            $UserList = $excelUsers
+            Write-Log "Excel user list applied (Count: $($excelUsers.Count)). Ignoring prefixes and interactive selection." -Level INFO
+        } else {
+            Write-Log "Excel user list import yielded no usernames; falling back to other selection parameters." -Level WARNING
+        }
     }
 
     # Apply selection logic (wrap in @( ) to force array so .Count works when a single object is returned)

@@ -71,6 +71,7 @@ Run in an elevated PowerShell session on an administrative host with access to a
 | `-AllUsers` | Switch | No | Process all discovered users |
 | `-UserList` | String[] | No | Comma-separated or array of explicit usernames |
 | `-UserPrefix` | String[] | No | One or more prefixes (supports comma-separated) |
+| `-UserListExcelPath` | String | No | Path to an `.xlsx` file containing usernames (first worksheet, first column named "Username"). Auto-installs ImportExcel if missing. Overrides other selection switches. |
 | `-ExistingProfileAction` | Overwrite/Maintain | No | Overwrite (default) or Maintain (skip copy if destination exists) |
 | `-SourceAzure` | Switch | No | Treat SourceShare as Azure Files (or auto-detected by UNC pattern) |
 | `-DestinationAzure` | Switch | No | Treat DestinationShare as Azure Files (or auto-detected by UNC pattern) |
@@ -103,6 +104,11 @@ Dry-run (no writes):
 Interactive user selection (omit targeting switches):
 ```powershell
 ./FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix$" -DestinationShare "\\new-server\fslogix$" -RedirectedShare "\\filesvr\Redirected$" -LogPath "C:\Temp\FSLogix-Migration-Logs"
+```
+
+Excel-based user list:
+```powershell
+./FSLogix-Profile-Migration.ps1 -SourceShare "\\old-server\fslogix$" -DestinationShare "\\new-server\fslogix$" -RedirectedShare "\\filesvr\Redirected$" -LogPath "C:\Temp\FSLogix-Migration-Logs" -UserListExcelPath "C:\Temp\UsersToMigrate.xlsx"
 ```
 
 Azure Files (explicit flags + passed credentials):
