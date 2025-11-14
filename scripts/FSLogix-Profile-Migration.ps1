@@ -396,14 +396,18 @@ function Copy-FSLogixProfile {
     }
     if (-not $profileExists) { New-Item -ItemType Directory -Path $destinationUserPath -Force | Out-Null }
     elseif ($ExistingProfileAction -eq 'Overwrite') { Write-Log "Overwrite mode: existing content may be updated via robocopy /MIR" -Level INFO }
+    # Invoke robocopy directly to stream its built-in progress (percentage bar). Remove /NP to allow progress output.
+    $logFileForUser = "$LogRunPath/robocopy-profile-$($UserInfo.Username).log"
     $robocopyArgs = @(
         "`"$($UserInfo.SourcePath)`"",
         "`"$destinationUserPath`"",
         "/MIR","/COPYALL","/DCOPY:DAT","/SECFIX","/TIMFIX","/MT:8","/R:3","/W:10",
-        "/LOG+:`"$LogRunPath/robocopy-profile-$($UserInfo.Username).log`"","/TEE","/NP","/NDL"
+        "/LOG+:`"$logFileForUser`"","/TEE","/NDL"
     )
-    $result = Start-Process -FilePath "robocopy.exe" -ArgumentList $robocopyArgs -Wait -PassThru -NoNewWindow
-    if ($result.ExitCode -ge 8) { throw "Robocopy failed with exit code $($result.ExitCode) for user $($UserInfo.Username)" }
+    Write-Log "Starting robocopy with real-time progress for profile ($($UserInfo.Username))" -Level INFO
+    & robocopy.exe @robocopyArgs | Write-Host
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ge 8) { throw "Robocopy failed with exit code $exitCode for user $($UserInfo.Username)" }
     Write-Log "Successfully processed FSLogix profile for user: $($UserInfo.Username)" -Level SUCCESS
     return @{ Path=$destinationUserPath; Copied=$true }
 }
@@ -566,7 +570,7 @@ function Copy-RedirectedFolders {
             if (!(Test-Path $destinationFolderPath)) {
                 New-Item -ItemType Directory -Path $destinationFolderPath -Force | Out-Null
             }
-            
+            # Stream robocopy output (remove /NP to show per-file percentage bar, add /TEE for console output)
             $robocopyArgs = @(
                 "`"$sourceFolderPath`"",
                 "`"$destinationFolderPath`"",
@@ -579,13 +583,15 @@ function Copy-RedirectedFolders {
                 "/R:3",
                 "/W:10",
                 "/LOG+:`"$LogRunPath/robocopy-$folder-$Username.log`"",
-                "/NP",
+                "/TEE",
                 "/NDL",
                 "/XJ"
             )
-            $result = Start-Process -FilePath "robocopy.exe" -ArgumentList $robocopyArgs -Wait -PassThru -NoNewWindow
-            if ($result.ExitCode -ge 8) {
-                Write-Log "Failed to copy $folder for $Username ($Username) - Exit code: $($result.ExitCode)" -Level "ERROR"
+            Write-Log "Robocopy (with progress) starting for $folder ($Username)" -Level INFO
+            & robocopy.exe @robocopyArgs | Write-Host
+            $exitCode = $LASTEXITCODE
+            if ($exitCode -ge 8) {
+                Write-Log "Failed to copy $folder for $Username - Exit code: $exitCode" -Level "ERROR"
                 $errorCount++
             } else {
                 Write-Log "Successfully copied $folder for $Username" -Level "SUCCESS"
