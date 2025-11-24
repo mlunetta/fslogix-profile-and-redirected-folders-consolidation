@@ -175,6 +175,21 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $logEntry
 }
 
+function Get-UserLogFolder {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Username
+    )
+
+    $safeName = [regex]::Replace($Username, '[\\/:*?"<>|]', '_')
+    if (-not $safeName) { $safeName = 'User' }
+    $userLogFolder = Join-Path $LogRunPath $safeName
+    if (!(Test-Path $userLogFolder)) {
+        New-Item -ItemType Directory -Path $userLogFolder -Force | Out-Null
+    }
+    return $userLogFolder
+}
+
 function Test-Prerequisites {
     Write-Log "Checking prerequisites..."
     
@@ -448,7 +463,8 @@ function Get-FreeDriveLetter {
 function Copy-FSLogixProfile {
     param(
         [Parameter(Mandatory=$true)] [PSCustomObject]$UserInfo,
-        [Parameter(Mandatory=$true)] [string]$ExistingProfileAction
+        [Parameter(Mandatory=$true)] [string]$ExistingProfileAction,
+        [Parameter(Mandatory=$true)] [string]$UserLogPath
     )
     $destinationUserPath = Join-Path $DestinationShare $UserInfo.Username
     $profileExists = Test-Path $destinationUserPath
@@ -465,7 +481,7 @@ function Copy-FSLogixProfile {
     if (-not $profileExists) { New-Item -ItemType Directory -Path $destinationUserPath -Force | Out-Null }
     elseif ($ExistingProfileAction -eq 'Overwrite') { Write-Log "Overwrite mode: existing content may be updated via robocopy /MIR" -Level INFO }
     # Invoke robocopy directly to stream its built-in progress (percentage bar). Remove /NP to allow progress output.
-    $logFileForUser = "$LogRunPath/robocopy-profile-$($UserInfo.Username).log"
+    $logFileForUser = Join-Path $UserLogPath 'robocopy-profile.log'
     $robocopyArgs = @(
         "`"$($UserInfo.SourcePath)`"",
         "`"$destinationUserPath`"",
@@ -594,7 +610,10 @@ function Copy-RedirectedFolders {
         [string]$Username,
         
         [Parameter(Mandatory=$true)]
-        [string]$MountedDrive
+        [string]$MountedDrive,
+
+        [Parameter(Mandatory=$true)]
+        [string]$UserLogPath
         
     )
     
@@ -639,6 +658,7 @@ function Copy-RedirectedFolders {
                 New-Item -ItemType Directory -Path $destinationFolderPath -Force | Out-Null
             }
             # Stream robocopy output (remove /NP to show per-file percentage bar, add /TEE for console output)
+            $folderLogPath = Join-Path $UserLogPath ("robocopy-{0}.log" -f $folder)
             $robocopyArgs = @(
                 "`"$sourceFolderPath`"",
                 "`"$destinationFolderPath`"",
@@ -650,7 +670,7 @@ function Copy-RedirectedFolders {
                 "/MT:4",
                 "/R:3",
                 "/W:10",
-                "/LOG+:`"$LogRunPath/robocopy-$folder-$Username.log`"",
+                "/LOG+:`"$folderLogPath`"",
                 "/TEE",
                 "/NDL",
                 "/XJ"
@@ -802,6 +822,7 @@ function Start-UserProfileMigration {
     )
     Write-Log "=== Starting migration for user: $($UserInfo.Username) ===" -Level INFO
     $driveLetter = $null
+    $userLogPath = Get-UserLogFolder -Username $UserInfo.Username
     $migrationResult = [ordered]@{
         Username = $UserInfo.Username
         ProfileCopied = $false
@@ -811,11 +832,12 @@ function Start-UserProfileMigration {
         RedirectedFoldersCopied = 0
         RedirectedFoldersErrors = 0
         Success = $false
+        UserLogPath = $userLogPath
     }
     $phase='Init'
     try {
         $phase='CopyProfile'
-        $copyOutcome = Copy-FSLogixProfile -UserInfo $UserInfo -ExistingProfileAction $ExistingProfileAction
+        $copyOutcome = Copy-FSLogixProfile -UserInfo $UserInfo -ExistingProfileAction $ExistingProfileAction -UserLogPath $userLogPath
         $destinationPath = $copyOutcome.Path
         $migrationResult.ProfileCopied = $copyOutcome.Copied
         $migrationResult.ProfileCopySkippedReason = $copyOutcome.SkippedReason
@@ -830,7 +852,7 @@ function Start-UserProfileMigration {
         $driveLetter = Mount-FSLogixVHDX -VHDXPath $destinationVHDXPath
         $migrationResult.VHDXMounted = $true
         $phase='CopyRedirectedFolders'
-        $folderResults = Copy-RedirectedFolders -Username $UserInfo.Username -MountedDrive $driveLetter
+        $folderResults = Copy-RedirectedFolders -Username $UserInfo.Username -MountedDrive $driveLetter -UserLogPath $userLogPath
         $migrationResult.RedirectedFoldersCopied = $folderResults.Success
         $migrationResult.RedirectedFoldersErrors = $folderResults.Errors
         $phase='RepairRegistry'
